@@ -45,7 +45,8 @@ pub fn get_wizard_handles() -> Vec<isize> {
 }
 
 /// Launch the Wizard101 game process.
-pub fn launch_game(game_path: &str) -> Result<(), VaultError> {
+/// `login_server` is "host:port" (e.g. "login.us.wizard101.com:12000").
+pub fn launch_game(game_path: &str, login_server: &str) -> Result<(), VaultError> {
     let bin_dir = Path::new(game_path).join("Bin");
     let exe = bin_dir.join("WizardGraphicalClient.exe");
 
@@ -56,10 +57,16 @@ pub fn launch_game(game_path: &str) -> Result<(), VaultError> {
         )));
     }
 
+    let (host, port) = login_server.rsplit_once(':').ok_or_else(|| {
+        VaultError::LaunchFailed(format!(
+            "Invalid login server format '{login_server}', expected host:port"
+        ))
+    })?;
+
     Command::new(&exe)
         .arg("-L")
-        .arg("login.us.wizard101.com")
-        .arg("12000")
+        .arg(host)
+        .arg(port)
         .current_dir(&bin_dir)
         .spawn()
         .map_err(|e| VaultError::LaunchFailed(e.to_string()))?;
