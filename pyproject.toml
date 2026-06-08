@@ -11,3 +11,14 @@ requires-python = ">=3.10"
 features = ["pyo3/extension-module"]
 profile = "release"
 bindings = "pyo3"
+
+[tool.uv]
+# Rebuild the compiled extension when the Rust sources or manifests change.
+# Without this, uv only invalidates its build cache on pyproject.toml changes
+# and silently keeps a stale .pyd after local Rust edits.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "src/**/*.rs" },
+]
