@@ -6,6 +6,7 @@ pub enum VaultError {
     CredentialWrite(String),
     CredentialDelete(String),
     CredentialEnumerate(String),
+    CredentialDecrypt(String),
     CredUiCancelled,
     CredUiFailed(String),
     MetadataIo(String),
@@ -28,6 +29,9 @@ impl fmt::Display for VaultError {
             VaultError::CredentialDelete(msg) => write!(f, "Failed to delete credential: {msg}"),
             VaultError::CredentialEnumerate(msg) => {
                 write!(f, "Failed to enumerate credentials: {msg}")
+            }
+            VaultError::CredentialDecrypt(msg) => {
+                write!(f, "Could not open the credential store: {msg}")
             }
             VaultError::CredUiCancelled => write!(f, "Credential dialog was cancelled by user"),
             VaultError::CredUiFailed(msg) => write!(f, "Credential dialog failed: {msg}"),
@@ -66,6 +70,7 @@ impl From<serde_json::Error> for VaultError {
     }
 }
 
+#[cfg(windows)]
 impl From<windows::core::Error> for VaultError {
     fn from(err: windows::core::Error) -> Self {
         VaultError::WindowsApi(err.to_string())

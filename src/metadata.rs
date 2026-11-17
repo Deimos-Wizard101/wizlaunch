@@ -47,11 +47,7 @@ impl Default for AccountMetadata {
 }
 
 fn metadata_path() -> Result<PathBuf, VaultError> {
-    let appdata = std::env::var("APPDATA")
-        .map_err(|_| VaultError::MetadataIo("APPDATA not set".to_string()))?;
-    let dir = PathBuf::from(appdata).join("Deimos");
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join("account_metadata.json"))
+    Ok(crate::platform::config_dir()?.join("account_metadata.json"))
 }
 
 pub fn load() -> Result<AccountMetadata, VaultError> {

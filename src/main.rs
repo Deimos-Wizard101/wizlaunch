@@ -27,7 +27,12 @@ fn usage() {
            --server <host:port>                   Login server (default: {DEFAULT_LOGIN_SERVER})\n\
            --timeout <secs>                       Window detection timeout (default: 30)\n\
            --steam                                Launch in Steam mode (-ST; ensures Steam is\n\
-                                                  running, signed in, and steam_appid.txt exists)"
+                                                  running, signed in, and steam_appid.txt\n\
+                                                  exists). Ignored on Linux, where the\n\
+                                                  client is launched through Proton.\n\
+         \n\
+         On Linux the Proton runner, prefix and FHS wrapper are detected; see the\n\
+         README for the WIZLAUNCH_* variables that override them."
     );
 }
 
@@ -44,6 +49,9 @@ fn main() {
         "add" => cmd_add(&args[1..]),
         "delete" => cmd_delete(&args[1..]),
         "launch" => cmd_launch(&args[1..]),
+        "login" => cmd_login(&args[1..]),
+        "login-vault" => cmd_login_vault(&args[1..]),
+        "spawn" => cmd_spawn(&args[1..]),
         "-h" | "--help" | "help" => {
             usage();
             Ok(())
@@ -83,6 +91,47 @@ fn cmd_add(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     credential_store::write_credential(nickname, &username, &password)?;
     metadata::ensure_nickname(nickname)?;
     println!("Account '{nickname}' saved.");
+    Ok(())
+}
+
+/// Dev/diagnostic: inject login into an already-running client by pid.
+///   wizlaunch-cli login <pid> <username> <password>
+/// Run with WIZLAUNCH_DEBUG=1 to trace where the injection stops.
+fn cmd_login(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let pid: isize = args
+        .first()
+        .ok_or("Usage: wizlaunch-cli login <pid> <user> <pass>")?
+        .parse()?;
+    let user = args.get(1).ok_or("need <username>")?;
+    let pass = args.get(2).ok_or("need <password>")?;
+    login::login_to_instance(pid, user, pass)?;
+    println!("login_to_instance returned Ok (bytecode executed, flag cleared)");
+    Ok(())
+}
+
+/// Dev/diagnostic: inject login into a running client, reading credentials from
+/// the vault so the password never appears on a command line.
+///   wizlaunch-cli login-vault <pid> <nickname>
+fn cmd_login_vault(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let pid: isize = args
+        .first()
+        .ok_or("Usage: wizlaunch-cli login-vault <pid> <nickname>")?
+        .parse()?;
+    let nickname = args.get(1).ok_or("need <nickname>")?;
+    let (user, pass) = credential_store::read_credential(nickname)?;
+    login::login_to_instance(pid, &user, &pass)?;
+    println!("login_to_instance returned Ok (bytecode executed, flag cleared)");
+    Ok(())
+}
+
+/// Dev/diagnostic: launch a non-Steam client (no login) and print its handle.
+///   wizlaunch-cli spawn [game_path]
+fn cmd_spawn(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let game_path = args.first().cloned().unwrap_or_else(launcher::default_game_path);
+    let before: HashSet<isize> = launcher::get_wizard_handles().into_iter().collect();
+    launcher::launch_game(&game_path, DEFAULT_LOGIN_SERVER, false)?;
+    let handle = launcher::wait_for_new_handle(&before, 180)?;
+    println!("{handle}");
     Ok(())
 }
 
@@ -132,7 +181,7 @@ fn cmd_launch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("Usage: wizlaunch launch <nick> [nicks...] [--path <path>] [--server <host:port>] [--steam]".into());
     }
 
-    let game_path = game_path.unwrap_or_else(|| detect_game_path());
+    let game_path = game_path.unwrap_or_else(launcher::default_game_path);
 
     if steam {
         println!("Ensuring Steam is running and signed in...");
@@ -159,20 +208,10 @@ fn cmd_launch(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 println!("  Logged in '{nickname}' (handle {handle}).");
             }
             Err(e) => {
-                eprintln!("  Failed to detect window for '{nickname}': {e}");
+                eprintln!("  Failed to detect instance for '{nickname}': {e}");
             }
         }
     }
 
     Ok(())
-}
-
-fn detect_game_path() -> String {
-    let steam = r"C:\Program Files (x86)\Steam\steamapps\common\Wizard101";
-    let default = r"C:\ProgramData\KingsIsle Entertainment\Wizard101";
-    if std::path::Path::new(steam).is_dir() {
-        steam.to_string()
-    } else {
-        default.to_string()
-    }
 }

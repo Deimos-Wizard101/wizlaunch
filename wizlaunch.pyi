@@ -1,15 +1,26 @@
-"""Type stubs for the wizlaunch native module."""
+"""Type stubs for the wizlaunch native module.
+
+Windows and Linux are both supported. Where behaviour differs it is noted on
+the function; the two that matter are that a ``handle`` is an HWND on Windows
+but a process id on Linux, and that Steam mode does nothing on Linux.
+"""
 
 def prompt_save_account(nickname: str) -> None:
-    """Open a Windows CredUI dialog to collect and store credentials for the given nickname.
+    """Prompt for and store credentials for the given nickname.
 
-    The dialog is OS-owned — Python never sees the username or password.
-    Raises RuntimeError if the user cancels or the dialog fails.
+    Python never sees the username or password: on Windows they are collected by
+    CredUI, a dialog the OS owns and draws, and on Linux they are read straight
+    off the controlling terminal. Either way they are used and dropped inside
+    the native module.
+
+    Because the Linux prompt needs a terminal, this raises RuntimeError when
+    called with no tty attached. It also raises if the user cancels or the
+    prompt fails.
     """
     ...
 
 def delete_account(nickname: str) -> None:
-    """Delete an account from Windows Credential Manager and metadata."""
+    """Delete an account from the credential store and metadata."""
     ...
 
 def list_accounts() -> list[str]:
@@ -21,7 +32,7 @@ def reorder_accounts(ordered: list[str]) -> None:
     ...
 
 def has_account(nickname: str) -> bool:
-    """Check if an account exists in Windows Credential Manager."""
+    """Check if an account exists in the credential store."""
     ...
 
 def validate_account(nickname: str) -> str | None:
@@ -38,7 +49,11 @@ def get_account_steam(nickname: str) -> bool | None:
     ...
 
 def set_account_steam(nickname: str, steam: bool) -> None:
-    """Set whether an account launches in Steam mode."""
+    """Set whether an account launches in Steam mode.
+
+    Stored on every platform, but only acted on by Windows. A Linux client is
+    launched through Proton with ``-L`` alone, so the flag changes nothing there.
+    """
     ...
 
 def get_window_config(
@@ -81,10 +96,13 @@ def launch_instance(
     login_server: str | None = None,
     timeout_secs: int = 30,
 ) -> int:
-    """Launch one game instance, log in, and return the window handle.
+    """Launch one game instance, log in, and return its handle.
 
-    Credentials are read from Credential Manager internally and never enter Python.
-    This function blocks — call via ``asyncio.to_thread()``.
+    The handle is an HWND on Windows and a process id on Linux; treat it as
+    opaque and pass it only back to this module.
+
+    Credentials are read from the credential store internally and never enter
+    Python. This function blocks — call via ``asyncio.to_thread()``.
     """
     ...
 
@@ -93,16 +111,16 @@ def launch_instances(
     login_server: str | None = None,
     timeout_secs: int = 30,
 ) -> dict[str, int]:
-    """Launch multiple game instances and return {nickname: window_handle}.
+    """Launch multiple game instances and return {nickname: handle}.
 
     Credentials never enter Python.  Blocks — call via ``asyncio.to_thread()``.
     """
     ...
 
 def kill_instance(handle: int) -> bool:
-    """Kill the process owning the given window handle. Returns True on success."""
+    """Kill the process behind the given handle. Returns True on success."""
     ...
 
 def get_wizard_handles() -> list[int]:
-    """Get all currently open Wizard101 window handles."""
+    """Get a handle for every currently running Wizard101 instance."""
     ...

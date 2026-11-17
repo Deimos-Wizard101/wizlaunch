@@ -154,13 +154,22 @@ fn launch_instance(
 
         let handle = launcher::wait_for_new_handle(&before, timeout_secs)?;
 
-        launcher::enable_window(handle, false);
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // On Linux the client is spawned by `proton run`, which never gets a
+        // Steam launch context, so Steam-mode accounts do NOT auto-authenticate —
+        // the `-ST` client just sits at the login screen. They have a stored
+        // username/password like any other account, so drive the login window the
+        // same way; only Windows (where Steam really does sign the client in) skips
+        // it. Previously Linux skipped Steam accounts and reported instant success
+        // while the client sat unauthenticated.
+        if !steam || !cfg!(target_os = "windows") {
+            launcher::enable_window(handle, false);
+            std::thread::sleep(std::time::Duration::from_secs(2));
 
-        let (username, password) = credential_store::read_credential(&nickname)?;
-        login::login_to_instance(handle, &username, &password)?;
+            let (username, password) = credential_store::read_credential(&nickname)?;
+            login::login_to_instance(handle, &username, &password)?;
 
-        launcher::enable_window(handle, true);
+            launcher::enable_window(handle, true);
+        }
 
         Ok::<isize, VaultError>(handle)
     })
@@ -200,13 +209,19 @@ fn launch_instances(
                 Ok(handle) => {
                     known.insert(handle);
 
-                    launcher::enable_window(handle, false);
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // On Linux `proton run` gives no Steam launch context, so
+                    // Steam accounts don't auto-authenticate — drive the login
+                    // window with their stored credentials like any other account
+                    // (see launch_instance). Only Windows skips it for Steam.
+                    if !steam || !cfg!(target_os = "windows") {
+                        launcher::enable_window(handle, false);
+                        std::thread::sleep(std::time::Duration::from_secs(2));
 
-                    let (username, password) = credential_store::read_credential(nickname)?;
-                    login::login_to_instance(handle, &username, &password)?;
+                        let (username, password) = credential_store::read_credential(nickname)?;
+                        login::login_to_instance(handle, &username, &password)?;
 
-                    launcher::enable_window(handle, true);
+                        launcher::enable_window(handle, true);
+                    }
                     results.insert(nickname.clone(), handle);
                 }
                 Err(e) => {

@@ -1,3 +1,6 @@
+// Everything OS-specific lives here; the modules below are shared.
+mod platform;
+
 pub mod credential_store;
 pub mod credui;
 pub mod errors;

@@ -1,21 +1,19 @@
+//! Memory-based login.
+//!
+//! Credentials are written straight into the client's address space and
+//! dispatched through its own command handler, so they never reach a location
+//! Python can read. Everything in this module — the signatures, the injected
+//! bytecode, the sequencing — is shared across platforms; only the mechanics of
+//! reading, writing and allocating remote memory differ, and those live behind
+//! [`crate::platform::process`].
+
 use crate::errors::VaultError;
-use std::ffi::c_void;
+use crate::platform::process::{find_module, RemoteProcess};
+use crate::platform::window::pid_for_handle;
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
-};
-use windows::Win32::System::Memory::{
-    VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
-    PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
-};
-use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
-    PROCESS_VM_WRITE,
-};
-use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+const WIZARD_MODULE: &str = "WizardGraphicalClient.exe";
 
 // Pattern to locate the game's internal command dispatcher.
 // Matches: mov r9b,1 / xor r8d,r8d / lea rdx,[rbp-31h] / mov rcx,[rip+??]
@@ -33,150 +31,26 @@ const HOOK_PATTERN: &[Option<u8>] = &[
 ];
 const HOOK_INSTR_LEN: usize = 7;
 
-// ── Remote process helpers ─────────────────────────────────────────
+/// How long to wait for the game client object to be constructed. The window
+/// existing is not proof of it: the injected code dereferences the client
+/// pointer, so it has to be non-null before anything is armed. Under Proton the
+/// client can take ~2 minutes to get this far, and callers (the GUI) arm login
+/// right after the process appears, so the default is generous; override with
+/// `WIZLAUNCH_CLIENT_WAIT`.
+const CLIENT_READY_TIMEOUT_SECS: u64 = 180;
 
-struct RemoteProcess {
-    handle: HANDLE,
-}
-
-impl RemoteProcess {
-    fn open(pid: u32) -> Result<Self, VaultError> {
-        let access = PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
-        let handle = unsafe {
-            OpenProcess(access, false, pid)
-                .map_err(|e| VaultError::LoginFailed(format!("OpenProcess: {e}")))?
-        };
-        Ok(Self { handle })
-    }
-
-    fn read(&self, addr: u64, size: usize) -> Result<Vec<u8>, VaultError> {
-        let mut buf = vec![0u8; size];
-        unsafe {
-            ReadProcessMemory(
-                self.handle,
-                addr as *const c_void,
-                buf.as_mut_ptr() as *mut c_void,
-                size,
-                None,
-            )
-            .map_err(|e| VaultError::LoginFailed(format!("ReadProcessMemory @ {addr:#x}: {e}")))?;
-        }
-        Ok(buf)
-    }
-
-    fn write(&self, addr: u64, data: &[u8]) -> Result<(), VaultError> {
-        unsafe {
-            WriteProcessMemory(
-                self.handle,
-                addr as *const c_void,
-                data.as_ptr() as *const c_void,
-                data.len(),
-                None,
-            )
-            .map_err(|e| VaultError::LoginFailed(format!("WriteProcessMemory @ {addr:#x}: {e}")))?;
-        }
-        Ok(())
-    }
-
-    fn alloc(&self, size: usize, executable: bool) -> Result<u64, VaultError> {
-        let protect = if executable { PAGE_EXECUTE_READWRITE } else { PAGE_READWRITE };
-        let ptr = unsafe {
-            VirtualAllocEx(
-                self.handle,
-                None,
-                size,
-                MEM_COMMIT | MEM_RESERVE,
-                protect,
-            )
-        };
-        if ptr.is_null() {
-            return Err(VaultError::LoginFailed("VirtualAllocEx returned NULL".into()));
-        }
-        Ok(ptr as u64)
-    }
-
-    /// Allocate memory within ±2 GB of `near` so a rel32 jump can reach it.
-    fn alloc_near(&self, near: u64, size: usize) -> Result<u64, VaultError> {
-        let granularity = 0x10000u64; // Windows allocation granularity
-        let max_range = 0x7FFF_0000u64; // ~2 GB
-
-        for offset in (granularity..max_range).step_by(granularity as usize) {
-            for &dir in &[1i64, -1i64] {
-                let candidate = (near as i64 + dir * offset as i64) as u64;
-                let candidate = candidate & !(granularity - 1);
-                let ptr = unsafe {
-                    VirtualAllocEx(
-                        self.handle,
-                        Some(candidate as *const c_void),
-                        size,
-                        MEM_COMMIT | MEM_RESERVE,
-                        PAGE_EXECUTE_READWRITE,
-                    )
-                };
-                if !ptr.is_null() {
-                    return Ok(ptr as u64);
-                }
-            }
-        }
-        Err(VaultError::LoginFailed(
-            "Failed to allocate executable memory within jump range".into(),
-        ))
-    }
-
-    fn free(&self, addr: u64) -> Result<(), VaultError> {
-        unsafe {
-            VirtualFreeEx(self.handle, addr as *mut c_void, 0, MEM_RELEASE)
-                .map_err(|e| VaultError::LoginFailed(format!("VirtualFreeEx: {e}")))?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for RemoteProcess {
-    fn drop(&mut self) {
-        unsafe { let _ = CloseHandle(self.handle); }
-    }
-}
-
-// ── Module enumeration ─────────────────────────────────────────────
-
-/// Returns (base_address, module_size) for the named module.
-fn find_module(pid: u32, name: &str) -> Result<(u64, u32), VaultError> {
-    let name_lower = name.to_lowercase();
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid)
-            .map_err(|e| VaultError::LoginFailed(format!("CreateToolhelp32Snapshot: {e}")))?;
-
-        let mut entry: MODULEENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
-
-        if Module32FirstW(snap, &mut entry).is_ok() {
-            loop {
-                let mod_name = String::from_utf16_lossy(
-                    &entry.szModule[..entry.szModule.iter().position(|&c| c == 0).unwrap_or(256)],
-                );
-                if mod_name.to_lowercase() == name_lower {
-                    let base = entry.modBaseAddr as u64;
-                    let size = entry.modBaseSize;
-                    let _ = CloseHandle(snap);
-                    return Ok((base, size));
-                }
-                if Module32NextW(snap, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snap);
-    }
-    Err(VaultError::LoginFailed(format!("Module '{name}' not found")))
+fn client_ready_timeout() -> u64 {
+    std::env::var("WIZLAUNCH_CLIENT_WAIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CLIENT_READY_TIMEOUT_SECS)
 }
 
 // ── Pattern scanning ───────────────────────────────────────────────
 
 /// Exact-byte pattern scan.  Returns offset within `data`.
 fn scan_exact(data: &[u8], pattern: &[u8]) -> Option<usize> {
-    data.windows(pattern.len())
-        .position(|w| w == pattern)
+    data.windows(pattern.len()).position(|w| w == pattern)
 }
 
 /// Wildcard pattern scan (None = any byte).  Returns offset within `data`.
@@ -225,10 +99,26 @@ fn build_login_bytecode(
     bc.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // placeholder
 
     // ── Login code (only executes when flag == 1) ──
-    // push rax, rcx, rdx, r8, r9, r10, r11
+    // push rax, rcx, rdx, r8, r9, r10, r11  (save volatiles the dispatcher clobbers)
     bc.extend_from_slice(&[0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53]);
-    // sub rsp, 0x28  (shadow space for x64 calling convention)
-    bc.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    // The hook fires at an arbitrary instruction, so rsp's 16-byte phase here is
+    // whatever the game left it, yet the dispatcher must be entered 16-aligned per
+    // the x64 ABI (it spills SSE). A fixed `sub rsp,0x28` assumes the hook fires on
+    // an aligned boundary; force alignment instead so it holds regardless:
+    //   push rbp; mov rbp,rsp; and rsp,-16; sub rsp,0x20 (32B shadow space)
+    bc.push(0x55); // push rbp
+    bc.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    bc.extend_from_slice(&[0x48, 0x83, 0xE4, 0xF0]); // and rsp, -16
+    bc.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20
+    // Clear the flag BEFORE dispatching, not after. The hook sits on a hot
+    // RootWindow path; if running the login command pumps the UI and re-enters
+    // this hook, the flag must already read 0 so the nested fire skips instead of
+    // dispatching again and recursing. (Needs the flag in writable memory — see
+    // RemoteProcess::alloc; a CPU store into the exec cave would fault.)
+    // mov rax, flag_addr ; mov byte [rax], 0
+    bc.extend_from_slice(&[0x48, 0xB8]);
+    bc.extend_from_slice(&flag_addr.to_le_bytes());
+    bc.extend_from_slice(&[0xC6, 0x00, 0x00]);
     // mov r9b, 1
     bc.extend_from_slice(&[0x41, 0xB1, 0x01]);
     // xor r8d, r8d
@@ -246,13 +136,9 @@ fn build_login_bytecode(
     bc.extend_from_slice(&func_addr.to_le_bytes());
     // call rax
     bc.extend_from_slice(&[0xFF, 0xD0]);
-    // mov rax, flag_addr
-    bc.extend_from_slice(&[0x48, 0xB8]);
-    bc.extend_from_slice(&flag_addr.to_le_bytes());
-    // mov byte [rax], 0  (clear flag — signals completion)
-    bc.extend_from_slice(&[0xC6, 0x00, 0x00]);
-    // add rsp, 0x28
-    bc.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    // mov rsp, rbp; pop rbp  (undo the alignment frame)
+    bc.extend_from_slice(&[0x48, 0x89, 0xEC]); // mov rsp, rbp
+    bc.push(0x5D); // pop rbp
     // pop r11, r10, r9, r8, rdx, rcx, rax
     bc.extend_from_slice(&[0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58]);
 
@@ -287,6 +173,25 @@ fn build_string_struct(data_addr: u64, len: usize) -> [u8; 32] {
     ss
 }
 
+/// Wait until the game client pointer the injected code dereferences is set.
+fn wait_for_client(proc: &RemoteProcess, dat_addr: u64, timeout_secs: u64) -> Result<(), VaultError> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    loop {
+        if let Ok(bytes) = proc.read(dat_addr, 8) {
+            if u64::from_le_bytes(bytes.try_into().unwrap()) != 0 {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(VaultError::LoginFailed(format!(
+                "Game client was not initialized within {timeout_secs}s"
+            )));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 // ── Public API ─────────────────────────────────────────────────────
 
 /// Log in to a Wizard101 instance using buffer-write injection.
@@ -294,27 +199,20 @@ fn build_string_struct(data_addr: u64, len: usize) -> [u8; 32] {
 /// Credentials are written directly into the game process memory and dispatched
 /// through the game's own command handler.  They never appear in any Python-
 /// accessible location.
-pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<(), VaultError> {
-    // 1. Get PID from window handle
-    let mut pid: u32 = 0;
-    unsafe {
-        GetWindowThreadProcessId(
-            windows::Win32::Foundation::HWND(hwnd as *mut c_void),
-            Some(&mut pid),
-        );
-    }
-    if pid == 0 {
-        return Err(VaultError::LoginFailed("Could not get PID from window handle".into()));
-    }
+pub fn login_to_instance(handle: isize, username: &str, password: &str) -> Result<(), VaultError> {
+    // 1. Resolve the instance handle to a process
+    let pid = pid_for_handle(handle).ok_or_else(|| {
+        VaultError::LoginFailed("Could not get PID from instance handle".into())
+    })?;
 
     // 2. Open the game process
     let proc = RemoteProcess::open(pid)?;
 
     // 3. Find WizardGraphicalClient.exe module
-    let (mod_base, mod_size) = find_module(pid, "WizardGraphicalClient.exe")?;
+    let (mod_base, mod_size) = find_module(pid, WIZARD_MODULE)?;
 
     // 4. Read module memory for pattern scanning
-    let module_mem = proc.read(mod_base, mod_size as usize)?;
+    let module_mem = proc.read_image(mod_base, mod_size as usize)?;
 
     // 5. Find the login function via LOGIN_PATTERN
     let login_offset = scan_exact(&module_mem, LOGIN_PATTERN)
@@ -336,19 +234,35 @@ pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<
     let hook_addr = mod_base + hook_offset as u64;
     let ret_addr = hook_addr + HOOK_INSTR_LEN as u64;
 
-    // 7. Save original bytes at hook site
+    let dbg = std::env::var("WIZLAUNCH_DEBUG").is_ok();
+    if dbg {
+        eprintln!(
+            "[login] mod_base={mod_base:#x} login@{login_addr:#x} dat={dat_addr:#x} \
+             func={func_addr:#x} hook@{hook_addr:#x}"
+        );
+    }
+
+    // 7. Wait for the client object, so the injected code has something to call
+    let wait_start = Instant::now();
+    wait_for_client(&proc, dat_addr, client_ready_timeout())?;
+    if dbg {
+        eprintln!("[login] client ready after {:?}", wait_start.elapsed());
+    }
+
+    // 8. Save original bytes at hook site
     let orig_instr = proc.read(hook_addr, HOOK_INSTR_LEN)?;
 
-    // 8. Build the login command string
+    // 9. Build the login command string
     let cmd = format!("login {} {}", username, password);
     let cmd_bytes: Vec<u8> = cmd.bytes().chain(std::iter::once(0)).collect();
     let cmd_len = cmd.len(); // length without null
 
-    // 9. Allocate remote memory
-    let str_data_addr = proc.alloc(cmd_bytes.len(), false)?;
-    let str_struct_addr = proc.alloc(32, false)?;
-    let flag_addr = proc.alloc(8, false)?;
-    let block_addr = proc.alloc_near(hook_addr, 512)?;
+    // 10. Allocate remote memory. Everything is anchored near the hook so the
+    //     bytecode block stays within rel32 reach of it.
+    let str_data_addr = proc.alloc(hook_addr, cmd_bytes.len(), false)?;
+    let str_struct_addr = proc.alloc(hook_addr, 32, false)?;
+    let flag_addr = proc.alloc(hook_addr, 8, false)?;
+    let block_addr = proc.alloc(hook_addr, 512, true)?;
 
     // Track allocations for cleanup
     let allocs = [str_data_addr, str_struct_addr, flag_addr, block_addr];
@@ -361,7 +275,7 @@ pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<
         }
     };
 
-    // 10. Write string data + struct + flag
+    // 11. Write string data + struct + flag
     if let Err(e) = proc.write(str_data_addr, &cmd_bytes) {
         cleanup(&proc, false);
         return Err(e);
@@ -376,7 +290,7 @@ pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<
         return Err(e);
     }
 
-    // 11. Build and write bytecode
+    // 12. Build and write bytecode
     let bytecode = build_login_bytecode(
         block_addr,
         flag_addr,
@@ -391,13 +305,21 @@ pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<
         return Err(e);
     }
 
-    // 12. Set the flag to arm the login
+    // 13. Set the flag to arm the login
     if let Err(e) = proc.write(flag_addr, &[0x01]) {
         cleanup(&proc, false);
         return Err(e);
     }
 
-    // 13. Patch the hook site: E9 <rel32 to block> + 2 NOOPs
+    if dbg {
+        eprintln!(
+            "[login] allocs: str_data={str_data_addr:#x} str_struct={str_struct_addr:#x} \
+             flag={flag_addr:#x} block={block_addr:#x} (block-hook={}B)",
+            block_addr as i64 - hook_addr as i64
+        );
+    }
+
+    // 14. Patch the hook site: E9 <rel32 to block> + 2 NOOPs
     let jmp_offset = (block_addr as i64 - (hook_addr as i64 + 5)) as i32;
     let mut jmp_bytes = vec![0xE9];
     jmp_bytes.extend_from_slice(&jmp_offset.to_le_bytes());
@@ -407,8 +329,17 @@ pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<
         return Err(e);
     }
 
-    // 14. Poll until the flag is cleared (bytecode sets it to 0 after login call)
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 15. Poll until the flag is cleared (bytecode sets it to 0 after login call).
+    //     The hook only fires once the client's UI loop reaches the RootWindow
+    //     path — i.e. when the login screen renders, which under Proton is ~90s
+    //     after launch. Callers arm right after the process appears, so this wait
+    //     has to span the whole render, not just the dispatch. Override with
+    //     WIZLAUNCH_LOGIN_WAIT.
+    let flag_wait_secs: u64 = std::env::var("WIZLAUNCH_LOGIN_WAIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180);
+    let deadline = Instant::now() + Duration::from_secs(flag_wait_secs);
     loop {
         thread::sleep(Duration::from_millis(50));
 
@@ -422,6 +353,13 @@ pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<
         }
 
         if Instant::now() > deadline {
+            if dbg {
+                let flag = proc.read(flag_addr, 1).ok().map(|b| b[0]);
+                let at_hook = proc.read(hook_addr, 7).ok();
+                eprintln!(
+                    "[login] timeout: flag={flag:?} (1 = hook never executed) hook_bytes={at_hook:02x?}"
+                );
+            }
             cleanup(&proc, true);
             return Err(VaultError::LoginFailed(
                 "Timed out waiting for login bytecode to execute".into(),
@@ -429,7 +367,7 @@ pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<
         }
     }
 
-    // 15. Restore original bytes and free allocations
+    // 16. Restore original bytes and free allocations
     cleanup(&proc, true);
 
     Ok(())

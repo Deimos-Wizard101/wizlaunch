@@ -1,48 +1,20 @@
+//! Starting instances and tracking the ones that are running.
+//!
+//! The instance identifier (`handle`) is whatever the platform uses to name a
+//! running client: an `HWND` on Windows, a pid on Linux. It is opaque to
+//! callers — pass it back to [`login_to_instance`][crate::login::login_to_instance],
+//! [`is_window_valid`] or [`kill_process_by_handle`] and nothing else.
+
 use crate::errors::VaultError;
+use crate::platform::{launch, window};
 use std::collections::HashSet;
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindow,
-};
 
-const WIZARD_CLASS: &str = "Wizard Graphical Client";
+pub use window::{enable_window, get_wizard_handles, is_window_valid, kill_process_by_handle};
 
-/// Convert an isize handle to HWND (0.58 uses *mut c_void).
-fn hwnd_from_isize(h: isize) -> HWND {
-    HWND(h as *mut c_void)
-}
-
-/// Enumerate all open Wizard101 window handles.
-pub fn get_wizard_handles() -> Vec<isize> {
-    let mut handles: Vec<isize> = Vec::new();
-
-    unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let handles = &mut *(lparam.0 as *mut Vec<isize>);
-        let mut class_buf = [0u16; 64];
-        let len = GetClassNameW(hwnd, &mut class_buf);
-        if len > 0 {
-            let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
-            if class_name == WIZARD_CLASS {
-                handles.push(hwnd.0 as isize);
-            }
-        }
-        BOOL(1) // continue enumeration
-    }
-
-    unsafe {
-        let _ = EnumWindows(
-            Some(enum_callback),
-            LPARAM(&mut handles as *mut Vec<isize> as isize),
-        );
-    }
-
-    handles
-}
+const WIZARD_EXE: &str = "WizardGraphicalClient.exe";
 
 /// Normalize a user-supplied path to the platform's native separators.
 fn normalize_path(path: &str) -> PathBuf {
@@ -51,12 +23,13 @@ fn normalize_path(path: &str) -> PathBuf {
 
 /// Launch the Wizard101 game process.
 /// `login_server` is "host:port" (e.g. "login.us.wizard101.com:12000").
-/// When `steam` is true, the client is started in Steam mode (`-ST`); callers
-/// are responsible for ensuring Steam is ready and `steam_appid.txt` is present
-/// (see [`crate::steam`]).
+///
+/// When `steam` is true the client is started in Steam mode; callers are
+/// responsible for ensuring Steam is ready first (see [`crate::steam`]). The
+/// flag has no effect on Linux.
 pub fn launch_game(game_path: &str, login_server: &str, steam: bool) -> Result<(), VaultError> {
-    let bin_dir = normalize_path(game_path).join("Bin");
-    let exe = bin_dir.join("WizardGraphicalClient.exe");
+    let game_dir = normalize_path(game_path);
+    let exe = game_dir.join("Bin").join(WIZARD_EXE);
 
     if !exe.exists() {
         return Err(VaultError::LaunchFailed(format!(
@@ -71,22 +44,11 @@ pub fn launch_game(game_path: &str, login_server: &str, steam: bool) -> Result<(
         ))
     })?;
 
-    let mut cmd = Command::new(&exe);
-    if steam {
-        cmd.arg("-ST");
-    }
-    cmd.arg("-L")
-        .arg(host)
-        .arg(port)
-        .current_dir(&bin_dir)
-        .spawn()
-        .map_err(|e| VaultError::LaunchFailed(e.to_string()))?;
-
-    Ok(())
+    launch::spawn_client(&game_dir, &exe, host, port, steam)
 }
 
-/// Wait for a new Wizard101 window to appear that wasn't in `before_handles`.
-/// Returns the new window handle, or error on timeout.
+/// Wait for a new Wizard101 instance to appear that wasn't in `before_handles`.
+/// Returns the new handle, or error on timeout.
 pub fn wait_for_new_handle(
     before_handles: &HashSet<isize>,
     timeout_secs: u64,
@@ -104,44 +66,11 @@ pub fn wait_for_new_handle(
     }
 
     Err(VaultError::LaunchTimeout(
-        "No new wizard window detected".to_string(),
+        "No new wizard instance detected".to_string(),
     ))
 }
 
-/// Disable or enable a window (prevents user input during login).
-pub fn enable_window(hwnd: isize, enable: bool) {
-    #[link(name = "user32")]
-    extern "system" {
-        fn EnableWindow(hwnd: *mut c_void, enable: i32) -> i32;
-    }
-    unsafe {
-        EnableWindow(hwnd as *mut c_void, if enable { 1 } else { 0 });
-    }
-}
-
-/// Check if a window handle is still valid.
-pub fn is_window_valid(hwnd: isize) -> bool {
-    unsafe { IsWindow(hwnd_from_isize(hwnd)).as_bool() }
-}
-
-/// Kill the process that owns a given window handle.
-pub fn kill_process_by_handle(hwnd: isize) -> Result<bool, VaultError> {
-    let mut pid: u32 = 0;
-    unsafe {
-        GetWindowThreadProcessId(hwnd_from_isize(hwnd), Some(&mut pid));
-    }
-
-    if pid == 0 {
-        return Ok(false);
-    }
-
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-    unsafe {
-        let process = OpenProcess(PROCESS_TERMINATE, false, pid)
-            .map_err(|e| VaultError::WindowsApi(e.to_string()))?;
-        let result = TerminateProcess(process, 1);
-        let _ = windows::Win32::Foundation::CloseHandle(process);
-        Ok(result.is_ok())
-    }
+/// Where the game is expected to live when no path is given.
+pub fn default_game_path() -> String {
+    launch::default_game_path()
 }

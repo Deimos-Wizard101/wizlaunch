@@ -20,7 +20,7 @@ serde_json = "1"
 default = ["pyo3"]
 python = ["pyo3"]
 
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
     "Win32_Security_Credentials",
@@ -34,3 +34,14 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+# Linux has no OS credential vault we can rely on (no secret-service daemon is
+# guaranteed), so the store is a passphrase-encrypted file: Argon2id for the
+# KDF, ChaCha20-Poly1305 for the sealed blob.
+[target.'cfg(unix)'.dependencies]
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+libc = "0.2"
+rpassword = "7"
+zeroize = "1"
